@@ -1,37 +1,29 @@
-"""
-Posture judgement on top of the 54x42 mask.
+"""54x42 zone depth map -> 자세 판정 -> posture Signal(phi/delta).
 
-The RP2040 already turns the ESP32's coverage field into a cleaned binary mask
-(threshold, open/close, hole fill, largest blob). This stage takes that mask and
-answers "what is the person doing", as a label plus two scalars a state machine
-downstream can consume.
+**센서 비의존 계층.** 입력은 VL53L9CX 가 내는 것과 같은 모양의 거리 배열 하나뿐이다.
+카메라 스텁(tof_stub.py)을 실센서로 갈아끼워도 이 파일은 그대로 쓴다.
+RGB·텍스처·얼굴 같은 카메라 고유 정보는 여기 들어오지 않는다.
 
-    mask (54x42) -> geometry -> baseline-relative deviation -> label + phi/delta
+판정하는 자세 (UPRIGHT 기준 대비):
+  ABSENT   자리비움    — 점유 zone 이 거의 없다. FSM 의 present 로 나간다
+  SLUMP    엎드림      — 이탈하면서 센서에 가까워진다
+  RECLINE  뒤로 젖힘   — 이탈하면서 센서에서 멀어진다
+  DROWSY   졸음        — 머리가 내려갔다 올라오기를 반복한다(꾸벅꾸벅)
 
-Nothing here knows it came from a camera. Feed it a mask from any sensor that
-produces this grid and it behaves the same.
+엎드림과 졸음은 둘 다 머리가 내려가지만 **시간 패턴**이 다르다 — 엎드림은 내려가서
+머무는 것, 졸음은 오르내림이 반복되는 것. 그래서 꾸벅임 횟수로 가른다. 꾸벅임 진폭은
+사람마다·거리마다 달라서 본인 baseline 크기에 대한 비율로 잡는다.
 
-The four things it separates:
+**엎드림과 젖힘은 머리 높이로 구분할 수 없다.** 2D 투영에서는 둘 다 머리가 화면
+아래로 내려간다(실측: 바른자세 head_row 0.098 -> 엎드림 0.341, 젖힘도 내려감).
+그래서 머리 높이·몸 접힘은 '얼마나 이탈했나'(크기)만 정하고, '어느 쪽 이탈인가'는
+거리 변화의 **부호**로 가른다 — 엎드리면 가까워지고(428->323mm) 젖히면 멀어진다.
 
-    UPRIGHT   the reference posture
-    SLUMP     head down and *stays* down
-    RECLINE   leaning back: the silhouette shrinks
-    DROWSY    head bobbing down and up repeatedly
-    ABSENT    almost nothing in frame
+사람 zone 은 절대 거리가 아니라 **배경 대비 침입량**으로 고른다. 실센서는 책상 상판과
+벽을 항상 같이 보기 때문에, 절대 임계(예: 1.2m 이내)로 자르면 책상이 늘 사람으로 잡힌다.
 
-Two ideas do most of the work.
-
-**Head height alone cannot tell slumping from reclining.** Both drop the head
-in the image - lean back in a chair and your head sinks in frame just as it
-does when you fold onto the desk. The discriminator has to be apparent size:
-leaning back moves you away from the camera and shrinks you, folding forward
-does not. So head height supplies *how far* from the reference, and the change
-in silhouette scale decides *which way*.
-
-**Slumping and nodding differ in time, not in shape.** At the instant a nod
-bottoms out the geometry is indistinguishable from a slump. Slumping is
-defined as staying down, so it only counts after the head has been low
-continuously for SLUMP_HOLD_S; a nod is over long before that.
+주의: 임계값은 실 ToF 로그로 재튜닝해야 한다. 스텁의 거리값은 기하만 맞고
+노이즈·책상 상판 반환 특성이 없다.
 """
 from __future__ import annotations
 
@@ -40,139 +32,196 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-W, H = 54, 42
+# docs/agent-briefing.md C1 — ToF 는 VL53L9CX (54x42 zone).
+ZONE_COLS, ZONE_ROWS = 54, 42
 
-PRESENT_MIN_OCC = 0.04    # occupied fraction below this reads as nobody there
+MAX_RANGE_MM = 4000.0    # 이보다 먼 값은 무효로 본다
+INTRUSION_MM = 150.0     # 배경보다 이만큼 가까우면 사람 zone
+BG_DECAY_MM = 1.0        # 자동 학습 시 배경이 프레임당 내려오는 폭
+PRESENT_MIN_OCC = 0.04   # 재실로 볼 최소 점유율
 
-# Head finding. Taking the topmost occupied row means a raised hand becomes the
-# head - it is higher than the head and the arm's distance then stands in for
-# the head's. A head is several cells wide and sits over the torso; a forearm
-# is one or two cells and can be anywhere.
-HEAD_MIN_WIDTH = 4
-HEAD_BAND_ROWS = 4
-TORSO_HALF_SPAN = 0.22    # fraction of frame width either side of the body axis
-
-SLUMP_SPAN = 0.22         # head this much lower (as a fraction of frame height) = full
-SLUMP_HOLD_S = 3.0        # head must stay down this long before it is a slump
-SLUMP_ARM_AT = 0.25       # deviation that starts the hold timer
-
-# Reclining shrinks the silhouette. Expressed as a fraction of the reference
-# scale rather than in pixels, so it does not need recalibrating when the
-# camera, its lens or the sitting distance change.
-RECLINE_SHRINK_SPAN = 0.18
-SCALE_DEADBAND = 0.04     # below this the size change is noise, not a lean
-
-# A nod is a dip and a recovery. Amplitude is relative to the person's own size
-# so it survives a different body or a different distance.
-NOD_WINDOW_S = 30.0
+SLUMP_SPAN = 0.22        # 머리가 baseline 대비 이만큼(세로 비율) 내려가면 이탈 최대
+# 엎드림은 '내려가서 머무는' 것이다. 이 시간을 채워야 엎드림으로 인정한다.
+# 이게 없으면 꾸벅임의 하강 순간마다 slump 가 치솟아 DROWSY 와 뒤섞인다
+# (slump 는 순간값, drowsy 는 30초 창값이라 시간 축이 애초에 안 맞는다).
+SLUMP_HOLD_S = 3.0
+# 지속 타이머를 켜는 문턱. 라벨 문턱(0.70)에서 켜면 그보다 낮은 이탈이 전부 0 으로
+# 죽어 delta 의 등급성이 사라진다(살짝 숙임 0.45 -> 0.00 이 됐었다).
+SLUMP_ARM_AT = 0.25
+RECLINE_SPAN_MM = 150.0  # 이만큼 멀어지면 젖힘 최대 (실측: 젖힘 +173mm, 엎드림 -105mm)
+DIST_DEADBAND_MM = 40.0  # 거리 노이즈. 이 안이면 방향을 정하지 않는다
+BASELINE_CLIP_AT = 0.02  # baseline top_row 가 이보다 작으면 머리가 화각에 잘린 것
+NOD_WINDOW_S = 30.0      # 꾸벅임 집계 창. FSM tick(30s)과 맞춰 둔다
+# 꾸벅임 진폭은 절대값이 아니라 **본인 baseline 세로 크기에 대한 비율**이다.
+# 사람마다 목 움직임이 다르고, 센서에서 멀어지면 같은 동작도 작게 찍히기 때문.
 NOD_AMPLITUDE_REL = 0.10
-NOD_AMPLITUDE_MIN = 0.04
-NOD_MIN_DOWN_S = 0.30     # shorter than this is jitter
-NOD_MAX_DOWN_S = 2.5      # longer than this is looking at something, not nodding
-NOD_REFRACTORY_S = 0.8
-NOD_RATE_FULL = 12.0      # nods per minute for a full drowsy contribution
-# One dip early in a session must not read as a high rate: dividing a single
-# event by a two-second observation gives 30/min. The denominator needs a floor.
+NOD_AMPLITUDE_MIN = 0.04  # baseline 이 없거나 지나치게 작을 때의 하한
+NOD_MIN_DOWN_S = 0.30    # 내려가 있던 시간이 이보다 짧으면 노이즈로 버린다
+# 조는 꾸벅임은 잠깐 떨어졌다 홱 올라온다. 키보드를 내려다보는 건 몇 초씩 머문다.
+# 그래서 오래 내려가 있던 하강은 꾸벅임으로 세지 않는다.
+NOD_MAX_DOWN_S = 2.5
+NOD_REFRACTORY_S = 0.8   # 직전 꾸벅임 이후 최소 간격
+NOD_RATE_FULL = 12.0     # 분당 이 횟수면 졸음 기여도 최대 (라벨은 그 절반인 6회/분)
+# 관측 시간이 짧을 때 그 시간으로 나누면 빈도가 커진다 — 꾸벅임 1회를 2초로
+# 나누면 30회/분. 분모에 하한을 둬서 단발 숙임이 졸음으로 읽히지 않게 한다.
 NOD_MIN_SPAN_S = 12.0
-# Drowsiness is a present-tense state. Waiting for events to age out of a 30 s
-# window keeps DROWSY on the screen for half a minute after someone wakes up,
-# so quiet time fades it out directly.
-NOD_QUIET_S = 8.0
-NOD_FADE_S = 6.0
+# 졸음은 '지금' 상태다. 꾸벅임을 멈췄는데 이벤트가 30초 창에서 빠지길 기다리면
+# 깨서 가만히 있어도 DROWSY 가 최대 30초 남는다. 그래서 마지막 꾸벅임 이후
+# 조용하면 창과 무관하게 기여도를 내린다.
+NOD_QUIET_S = 8.0        # 이만큼 조용하면 감쇠 시작
+NOD_FADE_S = 6.0         # 이 시간에 걸쳐 0 으로 (총 14초면 완전히 깨어난 것으로 본다)
+MOTION_SPAN = 0.06       # 움직임 정규화 기준
 
-MOTION_SPAN = 0.06
+# 머리 찾기 — '맨 위 점유 행'을 머리로 쓰면 손을 든 순간 그 손이 머리가 된다.
+# 머리는 폭이 넓고(팔뚝은 1~2 zone) 몸통 중심축 위에 있다는 두 조건으로 가른다.
+HEAD_MIN_WIDTH = 4       # 머리로 인정할 최소 가로 zone 수
+HEAD_BAND_ROWS = 4       # 머리 거리 산출에 쓸 행 수
+TORSO_HALF_SPAN = 0.22   # 몸통 중심에서 이 비율(가로) 안쪽만 머리 후보로 본다
 
-SLUMP_LABEL_AT = 0.70
+SLUMP_LABEL_AT = 0.70    # 라벨을 SLUMP 로 붙일 기여도
 RECLINE_LABEL_AT = 0.55
 DROWSY_LABEL_AT = 0.50
 
 
-@dataclass
-class Features:
-    occupancy: float      # occupied fraction of the grid
-    top_row: float        # head row, 0 at the top of the frame, 1 at the bottom
-    spread: float         # head to lowest occupied row
-    scale: float          # torso width as a fraction of frame width
-    motion: float         # cells that changed since the previous frame
+def _finite(depth_mm: np.ndarray) -> np.ndarray:
+    return np.where(np.isfinite(depth_mm), depth_mm, MAX_RANGE_MM)
 
 
 @dataclass
-class Verdict:
-    label: str
-    present: bool
-    phi: float            # contribution to "focused", [0, 1]
-    delta: float          # contribution to "fatigued", [0, 1]
-    features: Features
-    parts: dict[str, float] = field(default_factory=dict)
-    nod_rate: float = 0.0
+class ZoneFrame:
+    """한 프레임의 zone 거리 배열 (mm). NaN 은 무효 zone."""
+    depth_mm: np.ndarray
+
+
+@dataclass
+class BackgroundModel:
+    """zone 별 정적 배경 거리(책상 상판·벽).
+
+    책상을 비우고 capture() 하는 것이 정확하다. 못 했을 때를 위해 zone 별
+    '천천히 감쇠하는 최댓값'으로 자동 학습한다 — 사람은 zone 을 가깝게만 만든다는
+    성질을 쓰지만, 오래 완전히 정지해 있으면 사람이 배경으로 흡수된다.
+    """
+    ref_mm: np.ndarray | None = None
+    captured: bool = False
+
+    def capture(self, frames: list[np.ndarray]) -> None:
+        if not frames:
+            raise ValueError("배경을 만들 프레임이 없다")
+        self.ref_mm = np.median(np.stack([_finite(f) for f in frames]), axis=0)
+        self.captured = True
+
+    def update(self, depth_mm: np.ndarray) -> None:
+        if self.captured:
+            return
+        d = _finite(depth_mm)
+        if self.ref_mm is None or self.ref_mm.shape != d.shape:
+            self.ref_mm = np.full(d.shape, MAX_RANGE_MM, np.float64)
+        self.ref_mm = np.maximum(self.ref_mm - BG_DECAY_MM, d)
+
+    def occupied(self, depth_mm: np.ndarray) -> np.ndarray:
+        if self.ref_mm is None:
+            return np.zeros(depth_mm.shape, bool)
+        return (self.ref_mm - _finite(depth_mm)) >= INTRUSION_MM
+
+
+@dataclass
+class PostureFeatures:
+    occupancy: float      # 점유 zone 비율 [0,1]
+    top_row: float        # 최상단 점유 행 (0=위, 1=아래) — 머리 높이
+    centroid_row: float   # 점유 무게중심 행
+    spread: float         # 세로 점유 범위
+    head_mm: float        # 머리 zone 거리 중앙값 (mm)
+    motion: float         # 직전 프레임 대비 변화 zone 비율
+
+
+@dataclass
+class PostureVerdict:
+    label: str            # ABSENT/UPRIGHT/SLUMP/RECLINE/DROWSY/BASELINE/UNKNOWN
+    present: bool         # FSM SensorFrame.present 로 나간다
+    phi: float            # 집중 기여도 [0,1]
+    delta: float          # 피로 기여도 [0,1]
+    features: PostureFeatures
+    parts: dict[str, float] = field(default_factory=dict)   # 자세별 기여도
+    nod_rate: float = 0.0                                   # 분당 꾸벅임
     note: str = ""
 
 
-def find_head(mask: np.ndarray) -> tuple[int, int, int] | None:
-    """Head row and the column band of the body axis, or None if nothing fits.
+def find_head(occ: np.ndarray) -> tuple[int, int, int] | None:
+    """머리 행과 몸통 중심 열 구간을 찾는다. 반환: (행, 열_시작, 열_끝) 또는 None.
 
-    Returns the highest row that is both wide enough to be a head and sitting
-    over the body's axis, which is what keeps a raised arm from being mistaken
-    for one.
+    손을 들면 그 손이 최상단 점유 행이 되어 '머리가 올라갔다'로 읽히고, 머리 거리도
+    손 거리로 바뀐다. 그래서 최상단이 아니라 **폭이 충분하고 몸통 중심축 위에 있는**
+    가장 높은 행을 머리로 본다.
     """
-    counts = mask.sum(axis=1)
+    counts = occ.sum(axis=1)
     if not counts.any():
         return None
-    rows, cols = mask.shape
-
-    # The body axis: the column centroid of the widest rows, i.e. the torso.
-    body = np.flatnonzero(counts >= max(counts.max() * 0.5, 1.0))
-    col_weight = mask[body].sum(axis=0).astype(np.float64)
-    if col_weight.sum() <= 0:
-        return None
-    centre = float(col_weight @ np.arange(cols) / col_weight.sum())
-    half = max(TORSO_HALF_SPAN * cols, HEAD_MIN_WIDTH)
-    lo, hi = int(max(centre - half, 0)), int(min(centre + half, cols))
-
-    band = mask[:, lo:hi].sum(axis=1)
-    candidates = np.flatnonzero(band >= HEAD_MIN_WIDTH)
-    if candidates.size == 0:
-        return None
-    return int(candidates[0]), lo, hi
-
-
-def extract(mask: np.ndarray, prev: np.ndarray | None = None) -> tuple[Features, np.ndarray]:
-    """Geometry from one mask. Returns the features and the mask as a bool array."""
-    occ = mask.astype(bool)
     rows, cols = occ.shape
-    occupancy = float(occ.sum()) / float(occ.size)
+
+    # 몸통 = 가장 넓은 행들. 그 열 무게중심을 중심축으로 쓴다.
+    body = np.flatnonzero(counts >= max(counts.max() * 0.5, 1.0))
+    col_w = occ[body].sum(axis=0).astype(np.float64)
+    if col_w.sum() <= 0:
+        return None
+    center = float(col_w @ np.arange(cols) / col_w.sum())
+    half = max(TORSO_HALF_SPAN * cols, HEAD_MIN_WIDTH)
+    lo, hi = int(max(center - half, 0)), int(min(center + half, cols))
+
+    band = occ[:, lo:hi].sum(axis=1)
+    cand = np.flatnonzero(band >= HEAD_MIN_WIDTH)
+    if cand.size == 0:
+        return None
+    return int(cand[0]), lo, hi
+
+
+def extract(frame: ZoneFrame, background: BackgroundModel,
+            prev: np.ndarray | None = None) -> tuple[PostureFeatures, np.ndarray]:
+    """zone 배열에서 기하 특징을 뽑는다. 반환: (특징, 이번 점유 마스크)."""
+    background.update(frame.depth_mm)
+    occ = background.occupied(frame.depth_mm)
+    rows, _ = occ.shape
+    total = float(occ.size)
+    occupancy = float(occ.sum()) / total
+    depth = _finite(frame.depth_mm)
 
     head = find_head(occ)
     row_any = occ.any(axis=1)
     if head is not None and row_any.any():
-        top, _lo, _hi = head
+        top, lo, hi = head
         bottom = int(np.flatnonzero(row_any)[-1])
         top_row = top / (rows - 1)
         spread = max(bottom - top, 0) / (rows - 1)
-        # Scale = torso width. Shoulders keep their width whether you sit up or
-        # fold forward, so what moves it is distance - which is the point.
-        widths = occ.sum(axis=1)
-        wide = widths[widths >= max(widths.max() * 0.5, 1)]
-        scale = float(np.median(wide)) / cols
+        weights = occ.sum(axis=1).astype(np.float64)
+        centroid_row = float((weights @ np.arange(rows)) / weights.sum()) / (rows - 1)
+        # 머리 거리 = 머리 행부터 몇 줄, 몸통 중심 열 구간 안쪽만. 들어올린 손이
+        # 섞이지 않게 열도 같이 제한한다. 뒤로 젖힘을 잡는 축이라 오염되면 치명적이다.
+        end = min(top + HEAD_BAND_ROWS, rows)
+        mask = occ[top:end, lo:hi]
+        vals = depth[top:end, lo:hi][mask]
+        # 평균이 아니라 중앙값 — 머리 바로 위로 손을 들면 팔뚝이 소수 픽셀로 섞이는데,
+        # 평균은 그걸 따라가고(실측 -69mm) 중앙값은 버린다.
+        head_mm = float(np.median(vals)) if vals.size else float("nan")
     else:
-        top_row = spread = 1.0
-        scale = 0.0
+        top_row = centroid_row = spread = 1.0
+        head_mm = float("nan")
 
     motion = 0.0 if prev is None or prev.shape != occ.shape else \
-        float(np.logical_xor(occ, prev).sum()) / float(occ.size)
-    return Features(occupancy, top_row, spread, scale, motion), occ
+        float(np.logical_xor(occ, prev).sum()) / total
+    return PostureFeatures(occupancy, top_row, centroid_row, spread, head_mm, motion), occ
 
 
 @dataclass
 class NodDetector:
-    """Counts dip-and-recover cycles of the head and reports them per minute.
+    """머리 높이의 '내려갔다 올라오기'를 세어 분당 꾸벅임을 낸다.
 
-    The reference is the median over the window, so it follows a posture change.
-    That is what stops a sustained slump from registering as an endless nod:
-    once the head has been low for a while the median is low too.
+    FSM tick 이 30초라 engine 은 개별 꾸벅임을 볼 수 없다. 그래서 집계는 반드시
+    이 특징 계층에서 끝내고 delta 에 실어 보내야 한다.
+
+    기준선은 창의 중앙값이라 자세가 통째로 바뀌어도 따라간다. 그래서 엎드려서
+    머물면(중앙값이 같이 내려감) 꾸벅임으로 세지 않는다 — 엎드림과 졸음이 갈리는 지점.
     """
     window_s: float = NOD_WINDOW_S
-    amplitude: float = NOD_AMPLITUDE_MIN
+    amplitude: float = NOD_AMPLITUDE_MIN   # update() 에서 baseline 크기에 맞춰 갱신
     _hist: deque = field(default_factory=deque, repr=False)
     _events: deque = field(default_factory=deque, repr=False)
     _down_since: float | None = None
@@ -186,8 +235,8 @@ class NodDetector:
         self._abandoned = False
 
     def update(self, now: float, top_row: float, present: bool, scale: float = 1.0) -> float:
-        # With nobody there top_row flips between 1.0 and whatever noise is left,
-        # which counts as a stream of nods if it is not gated here.
+        # 사람이 없으면 top_row 가 1.0 과 잔여값 사이를 튀어 가짜 꾸벅임이 쌓인다
+        # (실측: 자리비움 상태에서 nod/min 40).
         if not present:
             self.reset()
             return 0.0
@@ -204,89 +253,104 @@ class NodDetector:
             up = top_row < rest + self.amplitude * 0.3
             if self._abandoned:
                 if up:
-                    self._abandoned = False
+                    self._abandoned = False                     # 다시 올라와야 재무장
             elif self._down_since is None:
                 if top_row > rest + self.amplitude:
-                    self._down_since = now
+                    self._down_since = now                      # 머리가 내려갔다
             elif up:
                 held = now - self._down_since
-                self._down_since = None
+                self._down_since = None                         # 다시 올라왔다
                 if (NOD_MIN_DOWN_S <= held <= NOD_MAX_DOWN_S
                         and now - self._last_event >= NOD_REFRACTORY_S):
-                    self._events.append(now)
+                    self._events.append(now)                    # 꾸벅 1회
                     self._last_event = now
             elif now - self._down_since > NOD_MAX_DOWN_S:
-                # Held down rather than bobbing. Void it so the eventual lift
-                # does not get counted as a very slow nod.
+                # 계속 내려가 있다 = 응시/엎드림. 올라올 때 뒤늦게 세지 않도록 무효화.
                 self._down_since = None
                 self._abandoned = True
 
+        # 창이 아직 안 찼으면 관측 시간으로 나눠 초반 과대평가를 막는다.
         span = max(now - self._hist[0][0], 1.0) if self._hist else self.window_s
         rate = len(self._events) * 60.0 / max(min(span, self.window_s), NOD_MIN_SPAN_S)
 
+        # 조용해지면 창에서 빠지길 기다리지 않고 내린다 — 깨어난 것을 바로 반영한다.
         quiet = now - self._last_event
         fade = float(np.clip(1.0 - (quiet - NOD_QUIET_S) / NOD_FADE_S, 0.0, 1.0))
         return rate * fade
 
 
 @dataclass
-class Baseline:
-    """The reference posture everything is measured against."""
+class PostureBaseline:
+    """바른 자세 기준값. FSM 의 START 단계 baseline 에 대응한다."""
     top_row: float
     spread: float
-    scale: float
+    head_mm: float
     samples: int = 0
-    clipped: bool = False   # head was cut off by the top of the frame
+    clipped: bool = False   # 머리가 화각 위쪽에 잘린 채로 측정됐다
 
     @classmethod
-    def from_features(cls, feats: list[Features]) -> "Baseline":
+    def from_features(cls, feats: list[PostureFeatures]) -> "PostureBaseline":
         if not feats:
-            raise ValueError("no frames to build a baseline from")
+            raise ValueError("baseline 을 만들 특징이 없다")
         med = lambda a: float(np.median([getattr(f, a) for f in feats]))
+        heads = [f.head_mm for f in feats if np.isfinite(f.head_mm)]
         top = med("top_row")
-        # A head touching row 0 means the frame cut it off. Measuring against
-        # that baseline reads every normal posture as "head has dropped".
-        return cls(top, med("spread"), med("scale"), len(feats), clipped=top < 0.02)
+        # top_row 가 0 에 붙으면 머리가 잘린 것이다. 그 baseline 을 쓰면 바른 자세도
+        # '머리가 내려갔다'로 읽혀 계속 이탈로 나온다(실측: 바른자세 slump 0.37).
+        return cls(top, med("spread"),
+                   float(np.median(heads)) if heads else float("nan"),
+                   len(feats), clipped=top < BASELINE_CLIP_AT)
 
 
-def judge(feats: Features, base: Baseline | None, nod_rate: float,
-          slump_held_s: float = SLUMP_HOLD_S) -> Verdict:
-    """Label and scores for one frame."""
+def judge(feats: PostureFeatures, base: PostureBaseline | None, nod_rate: float,
+          slump_held_s: float = SLUMP_HOLD_S) -> PostureVerdict:
+    """특징 + baseline + 꾸벅임 빈도 -> 자세 라벨과 phi/delta.
+
+    slump_held_s 는 머리가 연속으로 내려가 있던 시간. 짧으면 꾸벅임의 하강 국면일
+    뿐이라 엎드림 기여도를 비례해서 깎는다.
+    """
     if feats.occupancy < PRESENT_MIN_OCC:
-        return Verdict("ABSENT", False, 0.0, 0.0, feats, nod_rate=nod_rate,
-                       note="low occupancy")
+        return PostureVerdict("ABSENT", False, 0.0, 0.0, feats,
+                              nod_rate=nod_rate, note="low occupancy")
     if base is None:
-        return Verdict("UNKNOWN", True, 0.0, 0.0, feats, nod_rate=nod_rate,
-                       note="no baseline")
+        return PostureVerdict("UNKNOWN", True, 0.0, 0.0, feats,
+                              nod_rate=nod_rate, note="no baseline")
 
-    # How far from the reference, with no sense of direction.
-    drop = float(np.clip((feats.top_row - base.top_row) / SLUMP_SPAN, 0.0, 1.0))
+    # 1) 이탈 '크기' — 머리가 내려간 정도 + 몸이 접힌 정도. 방향 정보는 없다.
+    head_drop = feats.top_row - base.top_row
+    drop = float(np.clip(head_drop / SLUMP_SPAN, 0.0, 1.0))
     collapse = float(np.clip((base.spread - feats.spread) / max(base.spread, 1e-6), 0.0, 1.0))
     magnitude = float(np.clip(0.8 * drop + 0.2 * collapse, 0.0, 1.0))
 
-    # Which direction: a shrinking silhouette means moving away, i.e. leaning
-    # back. This is the only axis that separates reclining from slumping.
-    if base.scale > 1e-6:
-        shrink = (base.scale - feats.scale) / base.scale
-        recline = float(np.clip((shrink - SCALE_DEADBAND) / RECLINE_SHRINK_SPAN, 0.0, 1.0))
+    # 2) 젖힘은 '멀어진 거리' 자체가 고유 축이다. 머리 높이에 곱하면 안 된다 —
+    #    머리를 안 내리고 젖히는 경우가 0 으로 사라진다.
+    if np.isfinite(feats.head_mm) and np.isfinite(base.head_mm):
+        dist_delta = feats.head_mm - base.head_mm
+        recline = float(np.clip((dist_delta - DIST_DEADBAND_MM) / RECLINE_SPAN_MM, 0.0, 1.0))
     else:
-        shrink, recline = 0.0, 0.0
+        dist_delta, recline = 0.0, 0.0
 
-    # Suppress slumping while the silhouette says the person is moving away.
+    # 3) 엎드림은 머리 높이로 재되, 멀어지고 있으면 눌러 끈다. 2D 에선 젖혀도 머리가
+    #    내려가므로, 이 게이트가 없으면 젖힘이 전부 엎드림으로 빨려 들어간다.
     slump_raw = magnitude * (1.0 - recline)
+    # 지속 시간이 안 찼으면 아직 엎드림이 아니다 — 꾸벅임의 하강 국면과 구분되는 지점.
     slump = slump_raw * float(np.clip(slump_held_s / SLUMP_HOLD_S, 0.0, 1.0))
+
+    # dist_mm 은 바 없이 숫자로만 보여준다 — 지금 판정의 근거를 눈으로 확인하는 값.
+    # 4) 졸음 — 꾸벅임 빈도. 자세가 아니라 시간 패턴이라 별도 축이다.
     drowsy = float(np.clip(nod_rate / NOD_RATE_FULL, 0.0, 1.0))
 
     parts = {"slump": slump, "recline": recline, "drowsy": drowsy,
-             "shrink": shrink, "slump_raw": slump_raw}
-    # Reclining is bad posture but not necessarily tiredness, so it weighs less.
+             "dist_mm": dist_delta, "slump_raw": slump_raw}
+    # 뒤로 젖힘은 자세 불량이지만 각성 상태일 수 있어 피로 기여를 낮게 잡는다.
     delta = float(np.clip(max(0.95 * slump, 0.85 * drowsy, 0.45 * recline), 0.0, 1.0))
     stability = 1.0 - float(np.clip(feats.motion / MOTION_SPAN, 0.0, 1.0))
     phi = float(np.clip((1.0 - delta) * stability, 0.0, 1.0))
 
-    # Reclining is tested first: with the order reversed, slump crosses its
-    # threshold on the way back and RECLINE never appears. Slumping only
-    # qualifies once the hold has elapsed, so a nod cannot reach it.
+    # 젖힘을 먼저 본다. 반대로 두면 slump 가 먼저 문턱을 넘어 젖힘이 영영 안 뜬다
+    # (실측에서 recline 1.0 인데도 라벨이 SLUMP 로 나왔던 버그).
+    # 엎드림이 졸음보다 앞이다. slump 가 지속 조건(SLUMP_HOLD_S)을 통과해야만 올라오므로
+    # 꾸벅임의 하강 국면은 여기까지 못 온다 — 순간값과 창값이 섞이던 문제가 여기서 끊긴다.
     if recline >= RECLINE_LABEL_AT:
         label = "RECLINE"
     elif slump >= SLUMP_LABEL_AT:
@@ -295,45 +359,64 @@ def judge(feats: Features, base: Baseline | None, nod_rate: float,
         label = "DROWSY"
     else:
         label = "UPRIGHT"
-    note = "baseline clipped - recapture" if base.clipped else ""
-    return Verdict(label, True, phi, delta, feats, parts, nod_rate, note)
+    note = "baseline clipped - press b" if base.clipped else ""
+    return PostureVerdict(label, True, phi, delta, feats, parts, nod_rate, note)
 
 
 @dataclass
-class Tracker:
-    """Feed masks in, get verdicts out. Owns the baseline and the nod history."""
-    baseline: Baseline | None = None
+class PostureTracker:
+    """프레임을 계속 넣으면 배경·baseline 수집과 판정을 이어서 해준다."""
+    background: BackgroundModel = field(default_factory=BackgroundModel)
+    baseline: PostureBaseline | None = None
     nods: NodDetector = field(default_factory=NodDetector)
     _prev: np.ndarray | None = field(default=None, repr=False)
-    _buf: list[Features] = field(default_factory=list, repr=False)
-    _want: int = 0
+    _posture_buf: list[PostureFeatures] = field(default_factory=list, repr=False)
+    _bg_buf: list[np.ndarray] = field(default_factory=list, repr=False)
+    _want_posture: int = 0
+    _want_bg: int = 0
     _slump_since: float | None = field(default=None, repr=False)
 
+    def start_background(self, samples: int = 30) -> None:
+        """책상을 비운 상태에서 호출할 것."""
+        self._bg_buf, self._want_bg = [], samples
+
     def start_baseline(self, samples: int = 60) -> None:
-        """Call with the person sitting in the posture to measure against."""
-        self._buf, self._want = [], samples
+        """바른 자세로 앉은 상태에서 호출할 것."""
+        self._posture_buf, self._want_posture = [], samples
 
     @property
     def ready(self) -> bool:
-        return self.baseline is not None and self._want == 0
+        return self.baseline is not None and self._want_bg == 0 and self._want_posture == 0
 
-    def update(self, mask: np.ndarray, now: float) -> Verdict:
-        feats, self._prev = extract(mask, self._prev)
-        present = feats.occupancy >= PRESENT_MIN_OCC
-        scale_ref = self.baseline.spread if self.baseline else feats.spread
-        nod_rate = self.nods.update(now, feats.top_row, present, scale_ref)
-
-        if self._want > 0:
-            want = self._want
-            if present:
-                self._buf.append(feats)
-            done = len(self._buf)
+    def update(self, frame: ZoneFrame, now: float) -> PostureVerdict:
+        if self._want_bg > 0:
+            self._bg_buf.append(frame.depth_mm)
+            want, done = self._want_bg, len(self._bg_buf)
             if done >= want:
-                self.baseline = Baseline.from_features(self._buf)
-                self._want = 0
-            return Verdict("BASELINE", present, 0.0, 0.0, feats,
-                           nod_rate=nod_rate, note=f"baseline {done}/{want}")
+                self.background.capture(self._bg_buf)
+                self._want_bg = 0
+            feats, self._prev = extract(frame, self.background, self._prev)
+            return PostureVerdict("BASELINE", False, 0.0, 0.0, feats,
+                                  note=f"background {done}/{want}")
 
+        feats, self._prev = extract(frame, self.background, self._prev)
+        present = feats.occupancy >= PRESENT_MIN_OCC
+        scale = self.baseline.spread if self.baseline else feats.spread
+        nod_rate = self.nods.update(now, feats.top_row, present, scale)
+
+        if self._want_posture > 0:
+            want = self._want_posture
+            if feats.occupancy >= PRESENT_MIN_OCC:
+                self._posture_buf.append(feats)
+            done = len(self._posture_buf)
+            if done >= want:
+                self.baseline = PostureBaseline.from_features(self._posture_buf)
+                self._want_posture = 0
+            return PostureVerdict("BASELINE", True, 0.0, 0.0, feats,
+                                  nod_rate=nod_rate, note=f"posture {done}/{want}")
+
+        # 머리가 연속으로 내려가 있던 시간. 직전 프레임의 raw 값으로 재는 한 프레임
+        # 지연이 있지만 30fps 에서는 무시할 수 있다.
         held = (now - self._slump_since) if self._slump_since is not None else 0.0
         verdict = judge(feats, self.baseline, nod_rate, held)
 

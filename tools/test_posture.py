@@ -1,43 +1,48 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["numpy"]
+# dependencies = ["numpy", "opencv-python"]
 # ///
 """
-Synthetic check for posture.py. No board and no camera needed.
+Synthetic check for the posture stage. No board and no camera needed.
 
     uv run tools/test_posture.py
 
-Builds 54x42 masks by hand, drives them through the tracker and asserts the
-label that comes out. Every threshold in posture.py is exercised by at least
-one case, so this is what to run after changing one of them.
+Builds 54x42 masks by hand, pushes them through esp_source.mask_to_zone and the
+tracker, and asserts the label that comes out - the same path a real frame from
+the bridge takes. Also checks the wire framing, so a change to either end of
+esp_source is covered.
 
 Exits non-zero on the first failure.
 """
 from __future__ import annotations
 
+import binascii
+import contextlib
+import io
+import struct
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from posture import W, H, Tracker
+import esp_source as es
+from posture import PostureTracker, ZONE_COLS as W, ZONE_ROWS as H
 
 FPS = 30.0
 Y, X = np.mgrid[0:H, 0:W]
+failed = 0
 
 
 def person(head_row=6.0, scale=1.0, hand=None):
     """A head and a torso. scale < 1 is the same person further away."""
     cx = W / 2
     head_r = 5.0 * scale
-    torso_rx, torso_ry = 13.0 * scale, 15.0 * scale
-    head_cy = head_row + 4.0 * scale
-    torso_cy = head_row + 20.0 * scale
-
-    m = ((X - cx) ** 2 / head_r ** 2 + (Y - head_cy) ** 2 / head_r ** 2) <= 1.0
-    m |= ((X - cx) ** 2 / torso_rx ** 2 + (Y - torso_cy) ** 2 / torso_ry ** 2) <= 1.0
+    m = ((X - cx) ** 2 / head_r ** 2 + (Y - (head_row + 4 * scale)) ** 2 / head_r ** 2) <= 1.0
+    m |= (((X - cx) ** 2 / (13.0 * scale) ** 2
+           + (Y - (head_row + 20 * scale)) ** 2 / (15.0 * scale) ** 2) <= 1.0)
     if hand:
         col = cx if hand == "over" else cx + 16
         m |= (np.abs(X - col) <= 1) & (Y <= head_row + 22)
@@ -54,66 +59,91 @@ def nod(t, period=6.0, rest=6.0, depth=9.0):
     return rest
 
 
-def calibrate(seconds=1.5):
-    tr = Tracker()
-    tr.start_baseline(int(seconds * FPS))
-    t = 0.0
-    for _ in range(int(seconds * FPS)):
+def calibrated():
+    """A tracker past both calibration steps, and the clock it left off at."""
+    tr, t = PostureTracker(), 0.0
+    empty = np.zeros((H, W), np.uint8)
+    tr.start_background(20)
+    for _ in range(20):
         t += 1 / FPS
-        tr.update(person(), t)
-    assert tr.ready, "baseline was not captured"
+        tr.update(es.mask_to_zone(empty), t)
+    tr.start_baseline(40)
+    for _ in range(40):
+        t += 1 / FPS
+        tr.update(es.mask_to_zone(person()), t)
+    assert tr.baseline is not None, "baseline was not captured"
     return tr, t
 
 
-def hold(tr, t, frame_fn, seconds):
-    """Run a pose for a while and return the last verdict."""
-    n = int(seconds * FPS)
-    for i in range(n):
+def hold(tr, t, pose_fn, seconds):
+    for i in range(int(seconds * FPS)):
         t += 1 / FPS
-        v = tr.update(frame_fn(i / FPS), t)
+        v = tr.update(es.mask_to_zone(pose_fn(i / FPS)), t)
     return v, t
 
 
+# -- the wire format ------------------------------------------------------
+link = object.__new__(es._Link)
+link.buf, link.frames, link.stamps, link.lock = bytearray(), {}, {}, threading.Lock()
+payload = bytes((i * 7) % 256 for i in range(W * H))
+good = struct.pack("<BBHHHH", es.TYPE_MASK, 0, W, H, len(payload),
+                   binascii.crc_hqx(payload, 0xFFFF))
+link.buf += b"log text\n" + es.MAGIC + good + payload
+with contextlib.redirect_stdout(io.StringIO()):     # the parser echoes log text
+    link._parse()
+got = link.frames.get(es.TYPE_MASK)
+ok = got is not None and got.shape == (H, W) and bytes(got.ravel()) == payload
+failed += not ok
+print(f"frame parse      {'ok' if ok else 'FAIL'}")
+
+link.frames.clear(), link.buf.clear()
+bad = struct.pack("<BBHHHH", es.TYPE_MASK, 0, W, H, len(payload), 0x0000)
+link.buf += es.MAGIC + bad + payload
+with contextlib.redirect_stdout(io.StringIO()):
+    link._parse()
+ok = es.TYPE_MASK not in link.frames
+failed += not ok
+print(f"bad crc dropped  {'ok' if ok else 'FAIL'}\n")
+
+# -- the judgement --------------------------------------------------------
+# A slump has to be held: SLUMP_HOLD_S is what separates it from the bottom of
+# a nod, where the geometry is identical.
 CASES = [
-    # name,                     pose,                                 seconds, expected
-    ("upright",       lambda s: person(),                                 5.0, "UPRIGHT"),
-    ("slump",         lambda s: person(head_row=19.0),                    5.0, "SLUMP"),
-    ("recline",       lambda s: person(head_row=9.0, scale=0.78),         5.0, "RECLINE"),
-    ("drowsy",        lambda s: person(head_row=nod(s)),                 40.0, "DROWSY"),
-    ("absent",        lambda s: np.zeros((H, W), np.uint8),               2.0, "ABSENT"),
-    ("hand to side",  lambda s: person(hand="side"),                      5.0, "UPRIGHT"),
-    ("hand overhead", lambda s: person(hand="over"),                      5.0, "UPRIGHT"),
-    # A nod must not be mistaken for a slump even though the head is just as low
-    # at the bottom of it. Two seconds is longer than a dip, shorter than a hold.
-    ("brief dip",     lambda s: person(head_row=19.0),                    2.0, "UPRIGHT"),
+    ("upright",       lambda s: person(),                          5.0, "UPRIGHT"),
+    ("slump",         lambda s: person(head_row=19.0),             5.0, "SLUMP"),
+    ("recline",       lambda s: person(head_row=9.0, scale=0.70),  5.0, "RECLINE"),
+    ("drowsy",        lambda s: person(head_row=nod(s)),          40.0, "DROWSY"),
+    ("absent",        lambda s: np.zeros((H, W), np.uint8),        2.0, "ABSENT"),
+    ("hand to side",  lambda s: person(hand="side"),               5.0, "UPRIGHT"),
+    ("hand overhead", lambda s: person(hand="over"),               5.0, "UPRIGHT"),
+    ("brief dip",     lambda s: person(head_row=19.0),             2.0, "UPRIGHT"),
 ]
 
-failed = 0
-print(f"{'case':16s} {'got':9s} {'want':9s}  {'head':>5s} {'scale':>6s} "
+print(f"{'case':16s} {'got':9s} {'want':9s} {'head':>5s} {'dist':>8s} "
       f"{'slump':>6s} {'recl':>5s} {'drow':>5s}")
 for name, pose, seconds, want in CASES:
-    tr, t = calibrate()
+    tr, t = calibrated()
     v, t = hold(tr, t, pose, seconds)
     ok = v.label == want
     failed += not ok
-    f, p = v.features, v.parts
-    print(f"{name:16s} {v.label:9s} {want:9s}  {f.top_row:5.3f} {f.scale:6.3f} "
-          f"{p.get('slump', 0):6.2f} {p.get('recline', 0):5.2f} {p.get('drowsy', 0):5.2f}"
+    p = v.parts
+    print(f"{name:16s} {v.label:9s} {want:9s} {v.features.top_row:5.3f} "
+          f"{p.get('dist_mm', 0):+7.0f}mm {p.get('slump', 0):6.2f} "
+          f"{p.get('recline', 0):5.2f} {p.get('drowsy', 0):5.2f}"
           f"{'' if ok else '   <-- FAIL'}")
 
-# Waking up has to clear quickly: the 30 s counting window would otherwise keep
+# Waking up has to clear quickly; the 30 s counting window would otherwise hold
 # DROWSY on screen long after the nodding stopped.
-tr, t = calibrate()
+tr, t = calibrated()
 v, t = hold(tr, t, lambda s: person(head_row=nod(s)), 30.0)
 assert v.label == "DROWSY", f"expected DROWSY before the recovery test, got {v.label}"
-back = None
-t1 = t
-for i in range(int(40 * FPS)):
+back, t1 = None, t
+for _ in range(int(40 * FPS)):
     t += 1 / FPS
-    v = tr.update(person(), t)
+    v = tr.update(es.mask_to_zone(person()), t)
     if back is None and v.label == "UPRIGHT":
         back = t - t1
-print(f"\nwake-up recovery: {back:.1f} s" if back else "\nwake-up recovery: never")
+print(f"\nwake-up recovery: {f'{back:.1f} s' if back else 'never'}")
 if back is None or back > 20.0:
     failed += 1
     print("   <-- FAIL: should return to UPRIGHT within 20 s")
