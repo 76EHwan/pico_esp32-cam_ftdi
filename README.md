@@ -333,3 +333,48 @@ straight to the sketch.
   would cost PIO instructions for nothing.
 * Raw TinyUSB rather than `pico_stdio_usb`, because stdio does not expose
   DTR/RTS or the line coding — which is the entire point here.
+
+## Posture
+
+[tools/posture.py](tools/posture.py) turns the mask into a posture label plus
+two scalars — `phi` (focused) and `delta` (fatigued) — for a state machine
+downstream. [tools/posture_viewer.py](tools/posture_viewer.py) shows it live.
+
+```bash
+uv run tools/posture_viewer.py COM5     # SPACE captures the reference posture
+uv run tools/test_posture.py            # synthetic check, no board needed
+```
+
+It consumes TYPE_MASK, so everything vision.c already does — threshold, hole
+fill, open, largest blob — is upstream of it. Nothing here knows the mask came
+from a camera.
+
+```
+UPRIGHT   the reference posture
+SLUMP     head down and stays down
+RECLINE   leaning back
+DROWSY    head bobbing down and up repeatedly
+ABSENT    almost nothing in frame
+```
+
+**Head height cannot separate slumping from reclining.** Both drop the head in
+the image — lean back and it sinks in frame exactly as it does when you fold
+onto the desk. So head height only says *how far* from the reference, and the
+change in silhouette scale says *which way*: leaning back moves you away from
+the camera and shrinks you, folding forward does not. Scale is measured as
+torso width, because shoulders keep their width through a slump and only
+distance moves them.
+
+**Slumping and nodding differ in time, not in shape.** At the bottom of a nod
+the geometry is a slump. Slumping is defined as staying down, so it only counts
+once the head has been low for three continuous seconds, which a nod never
+reaches.
+
+**Everything is relative to a captured reference posture.** That is what lets
+one set of thresholds work for different people and sitting distances — nothing
+here is calibrated in pixels.
+
+One caveat worth knowing before tuning: a head touching row 0 means the frame
+cut it off, and a reference captured that way reads every later posture as
+"head has dropped". The panel says `baseline clipped` when it happens; tilt the
+camera down and recapture.
