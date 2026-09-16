@@ -349,45 +349,55 @@ parser rather than keeping a second copy of it.
 
 ## Posture
 
-[tools/posture.py](tools/posture.py) turns the mask into a posture label plus
-two scalars — `phi` (focused) and `delta` (fatigued) — for a state machine
-downstream. [tools/posture_viewer.py](tools/posture_viewer.py) shows it live.
+The posture stage answers "what is the person doing" as a label plus two
+scalars - `phi` (focused) and `delta` (fatigued) - for a state machine
+downstream.
 
 ```bash
-uv run tools/posture_viewer.py COM5     # SPACE captures the reference posture
-uv run tools/test_posture.py            # synthetic check, no board needed
+uv run tools/posture_viewer.py --source camera   # webcam stand-in, no board
+uv run tools/posture_viewer.py --source esp --port COM5
+uv run tools/test_posture.py                     # synthetic check, no board
 ```
 
-It consumes TYPE_MASK, so everything vision.c already does — threshold, hole
-fill, open, largest blob — is upstream of it. Nothing here knows the mask came
-from a camera.
+### The sensor is the only swappable part
 
-```
-UPRIGHT   the reference posture
-SLUMP     head down and stays down
-RECLINE   leaning back
-DROWSY    head bobbing down and up repeatedly
-ABSENT    almost nothing in frame
-```
+[tools/posture.py](tools/posture.py) takes one thing: a 54x42 array of
+distances. Everything that differs between sensors lives in an adapter that
+produces that array, so the judgement is written once.
+
+| | |
+|---|---|
+| [tools/esp_source.py](tools/esp_source.py) | bridge frames -> distances |
+| [tools/camera_source.py](tools/camera_source.py) | a webcam through the ESP32's and vision.c's stages, for when the boards are elsewhere |
+| *(later)* | a real depth sensor, unchanged downstream |
+
+**Neither adapter has depth**, so both estimate it from apparent size: torso
+width, because shoulders keep their width through a slump and only distance
+moves them. The distances that come out are geometrically right and
+absolutely approximate - fine for telling leaning back from folding forward,
+not to be read as millimetres.
+
+### Why it is built this way
 
 **Head height cannot separate slumping from reclining.** Both drop the head in
-the image — lean back and it sinks in frame exactly as it does when you fold
-onto the desk. So head height only says *how far* from the reference, and the
-change in silhouette scale says *which way*: leaning back moves you away from
-the camera and shrinks you, folding forward does not. Scale is measured as
-torso width, because shoulders keep their width through a slump and only
-distance moves them.
+the image - leaning back sinks it exactly as folding forward does. So head
+height only measures *how far* from the reference posture, and the change in
+apparent size decides *which way*.
 
 **Slumping and nodding differ in time, not in shape.** At the bottom of a nod
-the geometry is a slump. Slumping is defined as staying down, so it only counts
-once the head has been low for three continuous seconds, which a nod never
-reaches.
+the geometry is a slump. Slumping is therefore defined as staying down, and
+only counts after three continuous seconds, which a nod never reaches.
 
 **Everything is relative to a captured reference posture.** That is what lets
-one set of thresholds work for different people and sitting distances — nothing
-here is calibrated in pixels.
+one set of thresholds cover different people and sitting distances - nothing is
+calibrated in pixels.
 
-One caveat worth knowing before tuning: a head touching row 0 means the frame
-cut it off, and a reference captured that way reads every later posture as
-"head has dropped". The panel says `baseline clipped` when it happens; tilt the
-camera down and recapture.
+### Before tuning
+
+A head touching row 0 means the frame cut it off, and a reference captured that
+way reads every later posture as "head has dropped". The panel says
+`baseline clipped` when it happens; tilt the camera down and recapture.
+
+The judgement is only as good as the mask. If `coverage` is an outline with
+nothing inside it, that is the subject matching the background in brightness,
+and no threshold recovers what was never there.
