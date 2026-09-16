@@ -315,6 +315,19 @@ straight to the sketch.
 | `/` | both | print status |
 | `q` | | quit |
 
+### Just the camera
+
+```bash
+uv run tools/camview.py COM5
+```
+
+One window, the 160x120 picture, and the numbers that say whether it is usable.
+Framing, focus and exposure are settled at the camera and no later stage can
+recover from getting them wrong, so it is worth being able to look at that on
+its own without four panels and twenty keys in the way. It switches the preview
+stream on at startup and off again on exit, and borrows viewer.py's frame
+parser rather than keeping a second copy of it.
+
 ## Other design notes
 
 * **Backpressure comes from leaving bytes in the CDC FIFO.** The USB→UART path
