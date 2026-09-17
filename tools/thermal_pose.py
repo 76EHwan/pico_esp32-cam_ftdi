@@ -54,6 +54,7 @@ Keys:
     p         toggle low-res sensor simulation
     g         toggle sensor grid
     [ / ]     smaller / larger sensor pixels
+    r         capture the reference posture (sit how you mean to sit)
     x         let the ESP32 re-expose (its AEC/AGC are locked at boot)
     space     save a snapshot
 """
@@ -74,6 +75,7 @@ except ImportError:
     sys.exit("mediapipe is missing. Install it with: pip install mediapipe")
 
 from palette import PALETTES, build_lut, sensor_grid, zone_grid  # noqa: F401
+from posture_pose import PostureTracker
 from viewer import Link, TYPE_PREVIEW
 
 MODEL_URLS = {
@@ -382,6 +384,8 @@ def main():
     show_skeleton, use_seg = True, True
     pixelate = not args.sharp
     zones = not args.no_zones
+    posture = PostureTracker()
+    pending_reference = False
     # The webcam version tied the grid to the sensor simulation. Here the source
     # really is 160x120, so the pixels the grid would outline are the sensor's
     # own and drawing over them only costs contrast. Still on the 'g' key.
@@ -417,6 +421,21 @@ def main():
                 if show_skeleton and result.pose_landmarks:
                     joints = draw_skeleton(thermal, result.pose_landmarks, STYLES[style])
 
+                # Posture reads the first person's landmarks in normalised
+                # coordinates, so it is unaffected by --scale and by the zone
+                # view: everything it measures is a ratio of shoulder width.
+                pose_pts = {}
+                if result.pose_landmarks:
+                    for idx, lm in enumerate(result.pose_landmarks[0]):
+                        if lm.visibility >= VIS_MIN:
+                            pose_pts[idx] = (lm.x, lm.y)
+                if pending_reference:
+                    pending_reference = False
+                    ref_note = ("reference captured" if posture.capture_reference(pose_pts)
+                                else "reference NOT captured - both shoulders must be visible")
+                    print(f"[posture] {ref_note}")
+                post = posture.update(pose_pts, time.perf_counter())
+
                 mode = VIEWS[view]
                 if mode == "thermal":
                     canvas = thermal
@@ -444,7 +463,14 @@ def main():
                     f" | grid:{'on' if grid else 'off'}",
                     f"camera 160x120  min {lo:3d}  mean {mean:3d}  max {hi:3d}  "
                     f"spread {hi - lo:3d}  | aec:{'auto' if auto_exposure else 'locked'}",
-                    "q quit  m view  c palette  k/j skeleton  s bodyheat  z zones  p sensor  g grid  "
+                    (f"posture:{post.label}"
+                     + (f" <- {post.candidate} {post.held_for:.1f}s"
+                        if post.candidate != post.label else "")
+                     + (f"  drop {post.metrics.head_drop_delta:+.2f}"
+                        f"  scale {post.metrics.scale_ratio:.2f}"
+                        f"  wrist {min(post.metrics.wrist_to_head, 9.99):.2f}"
+                        if post.has_reference else "   press r while sitting upright")),
+                    "q quit  m view  c palette  k/j skeleton  s bodyheat  z zones  g grid  r posture  "
                     "[ ] size  x expose  SPACE save",
                 ])
                 cv2.imshow("thermal pose", canvas)
@@ -477,6 +503,8 @@ def main():
                     cell = max(cell - 2, 2)
                 elif key == ord("]"):
                     cell = min(cell + 2, 80)
+                elif key == ord("r"):
+                    pending_reference = True
                 elif key == ord("x"):
                     # The sketch exposes once at boot and freezes there, because
                     # background subtraction cannot survive a live AEC loop. No
