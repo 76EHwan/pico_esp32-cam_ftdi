@@ -330,8 +330,9 @@ def main():
                     help="sensor pixel size in screen pixels (default: --scale, "
                          "which lands on the camera's own pixels)")
     ap.add_argument("--style", default="tee", choices=STYLES, help="skeleton landmark set")
-    ap.add_argument("--zones", action="store_true",
-                    help=f"render at the {ZONE_W}x{ZONE_H} ToF zone grid")
+    ap.add_argument("--no-zones", action="store_true",
+                    help=f"start at the camera's own resolution instead of the "
+                         f"{ZONE_W}x{ZONE_H} ToF zone grid")
     ap.add_argument("--sharp", action="store_true", help="start without the low-res sensor look")
     ap.add_argument("--grid", action="store_true", help="start with the sensor grid drawn")
     ap.add_argument("--no-mirror", action="store_true")
@@ -371,7 +372,7 @@ def main():
     style = STYLES.index(args.style)
     show_skeleton, use_seg = True, True
     pixelate = not args.sharp
-    zones = args.zones
+    zones = not args.no_zones
     # The webcam version tied the grid to the sensor simulation. Here the source
     # really is 160x120, so the pixels the grid would outline are the sensor's
     # own and drawing over them only costs contrast. Still on the 'g' key.
