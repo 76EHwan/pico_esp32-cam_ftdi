@@ -106,12 +106,18 @@ UPPER_CONNECTIONS = [
 ]
 UPPER_POINTS = {0, 11, 12, 13, 14, 15, 16, 23, 24}
 
-# Head, shoulder bar, and a stem rising from the middle of it. CHEST is not a
-# MediaPipe landmark - there is no chest in the model's 33 - so it is given an
-# index past the end and filled in from the two shoulders at draw time.
+# Head, shoulder bar, a stem rising from the middle of it, and an arm off each
+# shoulder. CHEST is not a MediaPipe landmark - there is no chest in the model's
+# 33 - so it is given an index past the end and filled in from the two shoulders
+# at draw time.
 NOSE, L_SHOULDER, R_SHOULDER, CHEST = 0, 11, 12, 33
-TEE_CONNECTIONS = [(L_SHOULDER, R_SHOULDER), (CHEST, NOSE)]
-TEE_POINTS = {NOSE, L_SHOULDER, R_SHOULDER}
+L_ELBOW, R_ELBOW, L_WRIST, R_WRIST = 13, 14, 15, 16
+TEE_CONNECTIONS = [
+    (L_SHOULDER, R_SHOULDER), (CHEST, NOSE),
+    (L_SHOULDER, L_ELBOW), (L_ELBOW, L_WRIST),
+    (R_SHOULDER, R_ELBOW), (R_ELBOW, R_WRIST),
+]
+TEE_POINTS = {NOSE, L_SHOULDER, R_SHOULDER, L_ELBOW, R_ELBOW, L_WRIST, R_WRIST}
 
 # The grid the whole project targets: a VL53L9CX reports 2268 zones as 54x42.
 ZONE_W, ZONE_H = 54, 42
