@@ -63,7 +63,8 @@ ABSENT = "ABSENT"
 # third of what folding onto the desk produces. One threshold cannot catch both.
 SLUMP_DROP_ON = 0.35    # folding forward brings the nose down to the shoulder line
 SLUMP_DROP_OFF = 0.20   # hysteresis
-RECLINE_TIP = 0.12      # a tip this slight is all reclining leaves behind
+# RECLINE_TIP used to gate reclining on a neck foreshortening as well. Removed:
+# its sign depends on camera height and its size is swamped by the shoulders.
 SHRINK_ON = 0.90        # shoulders this much narrower than reference = further off
 SHRINK_OFF = 0.95       # hysteresis
 CHIN_NEAR = 0.70        # wrist within this of the head counts as beside it
@@ -192,13 +193,23 @@ class PostureTracker:
         if self._was_chin and not self._was_dropped:
             return CHIN_REST, "wrist beside the head, elbow dropped"
 
-        # Reclining is read from the shoulders receding, not from the head
-        # falling - see the thresholds above for why the fall is small. The tip
-        # has to be there too: shoulders that narrow with the neck unchanged is
-        # a chair pushed back, which is not a posture.
-        if self._was_receded and m.head_drop_delta > RECLINE_TIP:
-            return RECLINE, (f"shoulders {1 - m.scale_ratio:.0%} narrower, "
-                             f"neck foreshortened")
+        # Reclining is read from the shoulders receding, and from that alone.
+        #
+        # This asked for a neck foreshortening as well, on the reasoning that
+        # shoulders narrowing by themselves is a chair pushed back rather than a
+        # posture. Against a real camera that was wrong twice over: the sign of
+        # the change depends on where the camera sits - one below desk height
+        # looking up sees the neck lengthen as someone tips back, not shorten -
+        # and the magnitude is swamped anyway. Somebody lying back measured 0.19
+        # of their reference shoulder width, which no chair has room for, while
+        # the neck term went the other way and vetoed it.
+        #
+        # A chair genuinely pushed straight back does now read as RECLINE. That
+        # is the better error: it is rare, it is brief, and the hold timer
+        # absorbs most of it, whereas missing an actual recline means the state
+        # is simply never reported.
+        if self._was_receded:
+            return RECLINE, f"shoulders {1 - m.scale_ratio:.0%} narrower - further from the camera"
 
         if self._was_dropped:
             return SLUMP, "head down to the shoulder line, shoulders where they were"

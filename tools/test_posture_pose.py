@@ -74,9 +74,15 @@ CHIN_POSE = figure(head_y=0.19, wrist=(0.42, 0.26))
 # Same hand height, but the elbow is UP - waving, not resting.
 WAVE_POSE = figure(head_y=0.16, wrist=(0.42, 0.24), elbow_down=False)
 
+# Measured off a real camera sitting below desk height: lying back put the
+# shoulders at 0.19 of the reference width and moved the head the *other* way,
+# so any rule that also demanded a neck foreshortening vetoed it.
+LYING_BACK_POSE = figure(head_y=0.30, width=0.076, mid_y=0.62)
+
 CASES = [
     ("upright",        UPRIGHT_POSE, 3.0, UPRIGHT),
     ("recline",        RECLINE_POSE, 3.0, RECLINE),
+    ("lying back",     LYING_BACK_POSE, 3.0, RECLINE),
     ("slump",          SLUMP_POSE,   3.0, SLUMP),
     ("chin rest",      CHIN_POSE,    3.0, CHIN_REST),
     ("wave, not chin", WAVE_POSE,    3.0, UPRIGHT),
