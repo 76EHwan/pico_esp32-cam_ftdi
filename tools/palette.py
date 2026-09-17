@@ -53,3 +53,28 @@ def sensor_grid(img: np.ndarray, step: int) -> np.ndarray:
     img[::step, :] = (img[::step, :] * 0.30).astype(np.uint8)
     img[:, ::step] = (img[:, ::step] * 0.30).astype(np.uint8)
     return img
+
+
+def zone_grid(img: np.ndarray, cols: int, rows: int) -> np.ndarray:
+    """Darken the exact boundaries of a cols x rows grid drawn over `img`.
+
+    sensor_grid takes one integer step, which cannot describe the boundaries
+    when the display is not a whole multiple of the cell count: 800 pixels over
+    54 cells is 14.81 each, and a step of 14 has drifted three whole cells by
+    the right-hand edge - the lines stop matching the blocks and the last column
+    falls off the picture.
+
+    cv2.resize with INTER_NEAREST maps destination x to source floor(x*cols/w),
+    so cell i begins at ceil(i*w/cols). Computing each boundary that way puts
+    every line exactly on a block edge, whatever the two sizes are.
+    """
+    h, w = img.shape[:2]
+    # Integer ceiling division. Computing i*w/cols in floating point and taking
+    # ceil puts a boundary one pixel late wherever the quotient is a whole
+    # number that lands just above it, which is every time the two sizes share
+    # a factor.
+    xs = np.unique(((np.arange(cols + 1) * w + cols - 1) // cols).clip(0, w - 1))
+    ys = np.unique(((np.arange(rows + 1) * h + rows - 1) // rows).clip(0, h - 1))
+    img[ys, :] = (img[ys, :] * 0.30).astype(np.uint8)
+    img[:, xs] = (img[:, xs] * 0.30).astype(np.uint8)
+    return img

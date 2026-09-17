@@ -73,7 +73,7 @@ try:
 except ImportError:
     sys.exit("mediapipe is missing. Install it with: pip install mediapipe")
 
-from palette import PALETTES, build_lut, sensor_grid  # noqa: F401
+from palette import PALETTES, build_lut, sensor_grid, zone_grid  # noqa: F401
 from viewer import Link, TYPE_PREVIEW
 
 MODEL_URLS = {
@@ -246,7 +246,10 @@ def render_thermal(frame, mask, clahe, use_seg, pixelate, cell, palette, grid, z
         # One line per cell boundary. The webcam version drew two, which was
         # invisible at 16 screen pixels a cell and would swallow the picture
         # whole at the 4-6 this camera works out to.
-        sensor_grid(out, max(w // sw, 2) if zones else (cell if pixelate else 8))
+        if zones:
+            zone_grid(out, sw, sh)
+        else:
+            sensor_grid(out, cell if pixelate else 8)
     return out, name
 
 
